@@ -1,7 +1,6 @@
 package dev.recordable.screen;
 
 import dev.recordable.AudioCapture;
-import net.minecraft.client.input.MouseButtonEvent;
 import dev.recordable.RecordableConfig;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.screens.Screen;
@@ -93,7 +92,7 @@ public final class AudioHelpScreen extends Screen {
         addText("1. Verify 'Capture Audio' is ON in settings");
         addText("2. Make sure Minecraft sound is NOT muted in");
         addText("   Options > Music & Sounds");
-        addText("3. MouseButtonEvent 'Test Audio' to verify the recorder is");
+        addText("3. Click 'Test Audio' to verify the recorder is");
         addText("   receiving samples");
         addText("4. Restart Minecraft once if you toggled audio mods");
         addText("5. If you hear no audio in the recording, check that");
@@ -139,7 +138,7 @@ public final class AudioHelpScreen extends Screen {
         addText("1. Make sure 'Capture Audio' is ON in settings");
         addText("2. Confirm Minecraft is producing sound");
         addText("   (check the Music & Sounds menu)");
-        addText("3. MouseButtonEvent 'Test Audio' in the settings screen");
+        addText("3. Click 'Test Audio' in the settings screen");
     }
 
     private void buildLinuxHelp() {
@@ -152,7 +151,7 @@ public final class AudioHelpScreen extends Screen {
         addText("If audio still does not record:");
         addText("1. Make sure 'Capture Audio' is ON in settings");
         addText("2. Confirm Minecraft is producing sound");
-        addText("3. MouseButtonEvent 'Test Audio' in the settings screen");
+        addText("3. Click 'Test Audio' in the settings screen");
         addText("4. If using PipeWire, make sure the OpenAL backend");
         addText("   is not forced to a specific device");
     }
@@ -167,7 +166,7 @@ public final class AudioHelpScreen extends Screen {
         addText("If audio still does not record:");
         addText("1. Make sure 'Capture Audio' is ON in settings");
         addText("2. Confirm Minecraft is producing sound");
-        addText("3. MouseButtonEvent 'Test Audio' in the settings screen");
+        addText("3. Click 'Test Audio' in the settings screen");
     }
 
     private void buildAndroidHelp() {
@@ -182,7 +181,7 @@ public final class AudioHelpScreen extends Screen {
         addText("1. Make sure 'Capture Audio' is ON in settings");
         addText("2. Confirm Minecraft is producing sound");
         addText("   (turn up the master volume slider)");
-        addText("3. MouseButtonEvent 'Test Audio' to verify the recorder");
+        addText("3. Click 'Test Audio' to verify the recorder");
         addText("   is receiving samples");
         addBlank();
         addWarning("Tip: Some launchers need OpenAL Soft enabled in");

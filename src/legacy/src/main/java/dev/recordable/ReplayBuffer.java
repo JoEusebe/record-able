@@ -501,6 +501,27 @@ public final class ReplayBuffer {
         pb.redirectErrorStream(true);
 
         Process process = pb.start();
+        // Drain FFmpeg's merged stdout/stderr on a separate thread. If this pipe is never
+        // read, FFmpeg blocks once the OS pipe buffer (~64KB) fills, which in turn blocks the
+        // frame writes below and deadlocks the save until the JVM exits (same failure mode
+        // documented in KillClipBuffer.encode()).
+        final StringBuilder ffmpegLog = new StringBuilder();
+        Thread drain = new Thread(() -> {
+            try (java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    if (ffmpegLog.length() < 8000) {
+                        ffmpegLog.append(line).append('\n');
+                    }
+                }
+            } catch (Exception ignored) {
+                // best effort
+            }
+        }, "Record-able Replay Save FFmpeg Log");
+        drain.setDaemon(true);
+        drain.start();
+
         // Stream frames from disk to FFmpeg's stdin, reusing a handle per chunk.
         Map<Integer, RandomAccessFile> openChunks = new HashMap<>();
         try (OutputStream stdin = process.getOutputStream()) {
@@ -534,6 +555,11 @@ public final class ReplayBuffer {
         }
 
         int exitCode = process.waitFor();
+        try {
+            drain.join(2000);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
         if (exitCode == 0 && Files.exists(outputFile)) {
             long fileSize = Files.size(outputFile);
             String msg = "§a✓ Replay saved: " + outputFile.getFileName()
@@ -543,6 +569,7 @@ public final class ReplayBuffer {
             RecordableMod.LOGGER.info("Replay buffer saved: {} ({} frames, {} at {}x{})",
                     outputFile, frames.length, RecordingManager.formatBytes(fileSize), outWidth, outHeight);
         } else {
+            RecordableMod.LOGGER.warn("Replay buffer save failed (exit code {}): {}", exitCode, ffmpegLog.toString().trim());
             RecordableMod.sendClientMessage(ChatCategory.REPLAY_BUFFER, client, "§cReplay save failed (exit code " + exitCode + ").", false);
         }
     }

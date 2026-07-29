@@ -111,10 +111,14 @@ public final class PerformanceOptimizer {
 
     /** Pick the next escalation step that is enabled in config and not yet applied. */
     private Action nextEnabledAction(RecordableConfig config) {
-        // Escalation order respects "game priority" preference: cheapest visual
-        // impact first, then progressively more aggressive.
+        // Escalation order respects the "game priority" preference. When the user
+        // wants game framerate protected above all (perfModeGamePriority), reach for
+        // the highest-impact action (lower resolution) first since it recovers the
+        // most performance fastest. Otherwise favor recording quality: try the
+        // cheapest visual impact first (faster preset) and only fall back to
+        // lowering resolution as a last resort.
         Action[] order = config.perfModeGamePriority
-                ? new Action[]{Action.FASTER_PRESET, Action.LOWER_FPS, Action.LOWER_RESOLUTION}
+                ? new Action[]{Action.LOWER_RESOLUTION, Action.LOWER_FPS, Action.FASTER_PRESET}
                 : new Action[]{Action.FASTER_PRESET, Action.LOWER_FPS, Action.LOWER_RESOLUTION};
         for (Action a : order) {
             if (appliedThisSession.contains(a)) continue;

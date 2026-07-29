@@ -487,9 +487,8 @@ public final class VideoPlayerScreen extends Screen {
             }
         }
         if (extractedFramesDir != null) {
-            try {
-                Files.walk(extractedFramesDir)
-                        .sorted((a, b) -> b.getNameCount() - a.getNameCount())
+            try (java.util.stream.Stream<Path> walk = Files.walk(extractedFramesDir)) {
+                walk.sorted((a, b) -> b.getNameCount() - a.getNameCount())
                         .forEach(path -> {
                             try {
                                 Files.deleteIfExists(path);

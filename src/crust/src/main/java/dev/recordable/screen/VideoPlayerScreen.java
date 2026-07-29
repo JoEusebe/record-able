@@ -400,7 +400,14 @@ public final class VideoPlayerScreen extends Screen {
             cmd.add(videoFile.getAbsolutePath());
 
             try {
-                ffplayProcess = new ProcessBuilder(cmd).start();
+                // Discard ffplay's stdout/stderr explicitly: unlike the ffprobe/ffmpeg
+                // helpers above (which drain their output), nothing here ever reads
+                // these pipes, so without discarding them ffplay can block once the
+                // OS pipe buffer fills.
+                ffplayProcess = new ProcessBuilder(cmd)
+                        .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                        .redirectError(ProcessBuilder.Redirect.DISCARD)
+                        .start();
             } catch (IOException e) {
                 stopFrameExtraction();
                 openInDefaultPlayer();
@@ -639,6 +646,7 @@ public final class VideoPlayerScreen extends Screen {
             // Cap at 24fps for frame extraction - sufficient for smooth playback
             // preview while keeping disk I/O manageable for high-fps source videos.
             extractionFps = Math.max(8D, Math.min(24D, playbackFps));
+            extractionStartSeconds = Math.max(0D, seconds);
             int[] extractionSize = computeExtractionTargetSize(targetW, targetH);
             extractedFramesDir = Files.createTempDirectory("recordable-player-frames-");
             List<String> command = new ArrayList<>();
@@ -719,9 +727,8 @@ public final class VideoPlayerScreen extends Screen {
             }
         }
         if (extractedFramesDir != null) {
-            try {
-                Files.walk(extractedFramesDir)
-                        .sorted((a, b) -> b.getNameCount() - a.getNameCount())
+            try (java.util.stream.Stream<Path> walk = Files.walk(extractedFramesDir)) {
+                walk.sorted((a, b) -> b.getNameCount() - a.getNameCount())
                         .forEach(path -> {
                             try {
                                 Files.deleteIfExists(path);
@@ -895,7 +902,11 @@ public final class VideoPlayerScreen extends Screen {
     }
 
     private static String formatTime(double seconds) {
-        if (seconds <= 0D || Double.isNaN(seconds) || Double.isInfinite(seconds)) return "--:--";
+        // Only negative (sentinel "unknown", e.g. durationSeconds = -1 before probing
+        // finishes) or non-finite values are "unknown". 0 is a legitimate elapsed/duration
+        // value (e.g. playback position at the very start of the video) and must not be
+        // rendered as "--:--".
+        if (seconds < 0D || Double.isNaN(seconds) || Double.isInfinite(seconds)) return "--:--";
         int total = (int) Math.max(0, Math.round(seconds));
         int h = total / 3600;
         int m = (total % 3600) / 60;

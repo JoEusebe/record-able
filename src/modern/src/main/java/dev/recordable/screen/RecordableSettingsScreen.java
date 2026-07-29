@@ -279,7 +279,7 @@ public final class RecordableSettingsScreen extends Screen {
                             }
                     ).bounds(widgetLeft, 0, halfWidgetWidth, WIDGET_HEIGHT)
                             .tooltip(net.minecraft.client.gui.components.Tooltip.create(Component.literal(
-                                    "FFmpeg is the sole encoder. MouseButtonEvent to re-detect after installing/downloading.\n\n"
+                                    "FFmpeg is the sole encoder. Click to re-detect after installing/downloading.\n\n"
                                             + "FFmpeg status: " + status.displayText() + "\n"
                                             + "Install: " + PlatformUtils.getFfmpegInstallHint())))
                             .build(), y);
@@ -329,7 +329,7 @@ public final class RecordableSettingsScreen extends Screen {
                             }
                     ).bounds(widgetLeft, 0, widgetWidth, WIDGET_HEIGHT)
                             .tooltip(net.minecraft.client.gui.components.Tooltip.create(Component.literal(
-                                    "FFmpeg is the sole encoder. MouseButtonEvent to re-detect.\n\n"
+                                    "FFmpeg is the sole encoder. Click to re-detect.\n\n"
                                             + "FFmpeg status: " + status.displayText() + "\n"
                                             + "Audio: System loopback (DirectShow/PulseAudio/AVFoundation)\n\n"
                                             + "Install FFmpeg: " + PlatformUtils.getFfmpegInstallHint())))
@@ -2329,7 +2329,7 @@ public final class RecordableSettingsScreen extends Screen {
         this.minecraft.execute(() -> {
             this.minecraft.player.sendSystemMessage(Component.literal("⚠ Audio test failed. Try these fixes:"));
             this.minecraft.player.sendSystemMessage(Component.literal("1) Enable Stereo Mix: Sound settings → Recording → Show Disabled Devices → Enable"));
-            this.minecraft.player.sendSystemMessage(Component.literal("2) MouseButtonEvent Re-scan Audio, then run Test Audio again"));
+            this.minecraft.player.sendSystemMessage(Component.literal("2) Click Re-scan Audio, then run Test Audio again"));
             this.minecraft.player.sendSystemMessage(Component.literal("3) If audio is still unavailable, keep recording in video-only mode"));
             this.minecraft.player.sendSystemMessage(Component.literal("Tip: Use the Volume slider to boost quiet audio (up to 200%)."));
         });

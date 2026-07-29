@@ -1543,7 +1543,11 @@ public final class VideoCollectionScreen extends Screen {
             return false;
         }
         String name = path.getFileName().toString().toLowerCase(Locale.ROOT);
-        return name.endsWith(".mp4") || name.endsWith(".mkv");
+        // Must match every container RecordableConfig can actually produce
+        // (RecordableConfig.FORMATS / StorageManager's VIDEO_EXTS), otherwise
+        // recordings saved as .mov/.webm/.avi never show up in this gallery.
+        return name.endsWith(".mp4") || name.endsWith(".mkv") || name.endsWith(".webm")
+                || name.endsWith(".mov") || name.endsWith(".avi");
     }
 
     private record ActionZone(int x1, int y1, int x2, int y2, Runnable action) {

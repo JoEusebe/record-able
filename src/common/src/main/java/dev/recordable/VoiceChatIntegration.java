@@ -208,21 +208,33 @@ public final class VoiceChatIntegration {
         synchronized (LOCK) {
             if (!capturing) return;
             capturing = false;
+            // Capture the stream reference before any exception can occur so the
+            // finally block below can always close it, even if flushing fails.
+            OutputStream stream = sidecarStream;
             try {
                 // Flush everything still held in the mixing window.
                 flushSamples(accHighWater);
-                sidecarStream.flush();
-                sidecarStream.close();
-                patchWavHeader(sidecarFile, totalSamplesWritten);
-                RecordableMod.LOGGER.info("[Record-able] Voice chat capture finished: {} samples ({} bytes) -> {}",
-                        totalSamplesWritten, totalSamplesWritten * 2L, sidecarFile);
+                if (stream != null) {
+                    stream.flush();
+                }
             } catch (Throwable t) {
                 RecordableMod.LOGGER.warn("[Record-able] Failed to finalise voice chat capture: {}", t.toString());
             } finally {
+                // Always close the stream, even if flushSamples()/flush() threw above -
+                // otherwise the underlying file handle leaks until GC finalization.
+                if (stream != null) {
+                    try {
+                        stream.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
                 sidecarStream = null;
                 accumulator = null;
                 senderCursors.clear();
             }
+            patchWavHeader(sidecarFile, totalSamplesWritten);
+            RecordableMod.LOGGER.info("[Record-able] Voice chat capture finished: {} samples ({} bytes) -> {}",
+                    totalSamplesWritten, totalSamplesWritten * 2L, sidecarFile);
         }
     }
 
