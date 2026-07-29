@@ -1,0 +1,1555 @@
+package dev.recordable.screen;
+
+import dev.recordable.compat.RenderHelper;
+import dev.recordable.PlatformUtils;
+import dev.recordable.RecordableConfig;
+import dev.recordable.RecordableMod;
+import dev.recordable.StorageManager;
+import dev.recordable.VideoMetadata;
+import dev.recordable.VideoShareUploader;
+import dev.recordable.theme.*;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.tooltip.Tooltip;
+import dev.recordable.theme.CycleButton;
+import net.minecraft.client.gui.widget.ButtonWidget;
+import net.minecraft.client.gui.widget.TextFieldWidget;
+import net.minecraft.client.texture.NativeImage;
+import net.minecraft.client.texture.NativeImageBackedTexture;
+import net.minecraft.text.Text;
+import net.minecraft.util.Identifier;
+import net.minecraft.util.Util;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
+
+/** In-game video browser and management UI for recorded files. */
+public final class VideoCollectionScreen extends Screen {
+    private static final int ENTRY_HEIGHT = 62;
+    private static final int BUTTON_WIDTH = 54;
+    private static final int BUTTON_HEIGHT = 14;
+    private static final int DELETE_CONFIRM_MS = 6_000;
+    private static final String CLIP_EVENT_ALL = "__all__";
+    private static final String CLIP_EVENT_HINDSIGHT = "hindsight mode";
+    private static final List<String> DEFAULT_CLIP_EVENT_TYPES = List.of(
+            "on totem pop", "kills", "deaths", CLIP_EVENT_HINDSIGHT, "custom_events", "legacy", "other");
+
+    private final Screen parent;
+    /** When true, this screen shows the separate "Clips" collection (auto-clips) instead of recordings. */
+    private final boolean clipsMode;
+    private final String initialClipEvent;
+    private final boolean hindsightCategoryMode;
+    private final List<VideoMetadata> allVideos = new ArrayList<>();
+    private final List<VideoMetadata> filteredVideos = new ArrayList<>();
+    private final List<ActionZone> actionZones = new ArrayList<>();
+    private final Map<Path, ThumbnailTexture> thumbnailCache = new HashMap<>();
+    private final Map<Path, String> clipEventByPath = new HashMap<>();
+    private final List<String> clipEventOptions = new ArrayList<>();
+
+    private TextFieldWidget searchField;
+    private CycleButton clipEventButton;
+    private String selectedClipEvent = CLIP_EVENT_ALL;
+    private Text statusMessage;
+    private boolean statusIsError;
+    private int scrollOffset;
+    private boolean draggingScrollbar;
+
+    private int contentLeft;
+    private int contentWidth;
+    private int listLeft;
+    private int listRight;
+    private int listTop;
+    private int listBottom;
+    private int headerTop;
+
+    private long totalSizeBytes;
+    private Path deleteConfirmPath;
+    private long deleteConfirmUntil;
+
+    /** Background thread for probing durations without blocking the render thread. */
+    private volatile ExecutorService durationProber;
+    private final AtomicBoolean durationProbeRunning = new AtomicBoolean(false);
+
+    /** The recording currently offered for sharing (non-null while the host-choice modal is open). */
+    private VideoMetadata shareTarget;
+    /** True while the retention (7/30/60 day) drawer is expanded next to the re.share-abl.ink button. */
+    private boolean shareRetentionDrawerOpen;
+    /** True while an upload is running so the modal can show progress and block re-entry. */
+    private volatile boolean sharing;
+    /** Background thread that performs the upload without blocking the render thread. */
+    private volatile ExecutorService shareUploader;
+    /** Short success text shown in the share overlay after upload finishes. */
+    private Text shareOverlayMessage;
+    /** Timestamp (ms) until which the success overlay stays visible. */
+    private long shareOverlayUntilMs;
+
+    public VideoCollectionScreen(Screen parent) {
+        this(parent, false);
+    }
+
+    public VideoCollectionScreen(Screen parent, boolean clipsMode) {
+        this(parent, clipsMode, null);
+    }
+
+    public VideoCollectionScreen(Screen parent, boolean clipsMode, String initialClipEvent) {
+        super(Text.translatable(clipsMode
+                ? "screen.recordable.video_collection.clips_title"
+                : "screen.recordable.video_collection.title"));
+        this.parent = parent instanceof VideoCollectionScreen previous ? previous.parent : parent;
+        this.clipsMode = clipsMode;
+        this.initialClipEvent = initialClipEvent;
+        this.hindsightCategoryMode = clipsMode && CLIP_EVENT_HINDSIGHT.equals(initialClipEvent);
+    }
+
+    @Override
+    protected void init() {
+        super.init();
+        this.clearChildren();
+        this.actionZones.clear();
+        this.clipEventButton = null;
+
+        this.contentWidth = Math.max(320, Math.min((int) (this.width * 0.92D), 980));
+        this.contentLeft = (this.width - this.contentWidth) / 2;
+
+        // Reserve a fixed header band at the very top for the panel title and
+        // summary, then place the action buttons just below it. Anchoring the
+        // title to a fixed top (rather than relative to the list) prevents the
+        // title/summary from overlapping the buttons when the buttons wrap onto
+        // additional rows (which happens on phones / large GUI scales).
+        this.headerTop = Math.max(6, (int) (this.height * 0.025D));
+        int topBarY = this.headerTop + 18;
+        int rowLeft = this.contentLeft + 8;
+        int rowRight = this.contentLeft + this.contentWidth - 8;
+        int btnGap = 4;
+        int btnH = 18;
+        List<Integer> btnWidths = new ArrayList<>(List.of(74, 84, 130, 78, 110, 94));
+        List<Text> btnLabels = new ArrayList<>(List.of(
+                Text.translatable("screen.recordable.video_collection.back"),
+                Text.translatable("screen.recordable.video_collection.settings"),
+                Text.translatable("screen.recordable.video_collection.open_recordings_folder"),
+                Text.translatable("screen.recordable.video_collection.refresh"),
+                Text.translatable("screen.recordable.video_collection.sort")
+                        .copy().append(Text.literal(": " + sortModeLabel(RecordableConfig.get().gallerySortMode))),
+                Text.literal(categoryToggleLabel())
+        ));
+        List<ButtonWidget.PressAction> btnActions = new ArrayList<>(List.of(
+                button -> close(),
+                button -> { if (this.client != null) { this.client.setScreen(new RecordableSettingsScreen(this)); } },
+                button -> openRecordingsFolder(),
+                button -> refreshVideos(),
+                button -> cycleSortMode(),
+                button -> cycleCategoryView(true)
+        ));
+        int sortButtonIndex = 4;
+        int categoryButtonIndex = 5;
+        int totalBtnWidth = 0;
+        for (int w : btnWidths) { totalBtnWidth += w; }
+        totalBtnWidth += btnGap * (btnWidths.size() - 1);
+
+        // Responsive top toolbar: the search bar has been removed, so the action
+        // buttons use the full content width. They are right-aligned on a single
+        // row when they fit, otherwise they wrap onto additional rows.
+        // Index 2 is "Open Recordings Folder". On Android the launcher sandbox
+        // cannot hand a folder to an external app, so it is shown disabled with a
+        // tooltip - recordings are auto-saved to the gallery (Movies/Record-able).
+        Tooltip androidFolderTip = Tooltip.of(Text.literal(
+                "Not available on Android. Recordings are auto-saved to your gallery "
+                        + "(Movies/Record-able) - open them from your Gallery or Files app."));
+
+        int availWidth = rowRight - rowLeft;
+        int lastRowY = topBarY;
+        if (totalBtnWidth <= availWidth) {
+            int x = rowRight;
+            for (int i = btnWidths.size() - 1; i >= 0; i--) {
+                int width = btnWidths.get(i);
+                x -= width;
+                ButtonWidget btn;
+                if (i == sortButtonIndex) {
+                    btn = CycleButton.create(x, topBarY, width, btnH, btnLabels.get(i),
+                            b -> cycleSortMode(true), b -> cycleSortMode(false));
+                } else if (i == categoryButtonIndex) {
+                    btn = CycleButton.create(x, topBarY, width, btnH, btnLabels.get(i),
+                            b -> cycleCategoryView(true), b -> cycleCategoryView(false));
+                } else {
+                    btn = ButtonWidget.builder(btnLabels.get(i), btnActions.get(i))
+                            .dimensions(x, topBarY, width, btnH).build();
+                }
+                if (i == 2 && PlatformUtils.isAndroid()) {
+                    btn.active = false;
+                    btn.setTooltip(androidFolderTip);
+                }
+                this.addDrawableChild(btn);
+                x -= btnGap;
+            }
+        } else {
+            int x = rowLeft;
+            int y = topBarY;
+            for (int i = 0; i < btnWidths.size(); i++) {
+                int width = btnWidths.get(i);
+                if (x > rowLeft && x + width > rowRight) {
+                    x = rowLeft;
+                    y += btnH + btnGap;
+                }
+                ButtonWidget btn;
+                if (i == sortButtonIndex) {
+                    btn = CycleButton.create(x, y, width, btnH, btnLabels.get(i),
+                            b -> cycleSortMode(true), b -> cycleSortMode(false));
+                } else if (i == categoryButtonIndex) {
+                    btn = CycleButton.create(x, y, width, btnH, btnLabels.get(i),
+                            b -> cycleCategoryView(true), b -> cycleCategoryView(false));
+                } else {
+                    btn = ButtonWidget.builder(btnLabels.get(i), btnActions.get(i))
+                            .dimensions(x, y, width, btnH).build();
+                }
+                if (i == 2 && PlatformUtils.isAndroid()) {
+                    btn.active = false;
+                    btn.setTooltip(androidFolderTip);
+                }
+                this.addDrawableChild(btn);
+                x += width + btnGap;
+            }
+            lastRowY = y;
+        }
+        if (this.clipsMode && !this.hindsightCategoryMode) {
+            syncSelectedClipEvent();
+            int eventY = lastRowY + btnH + btnGap;
+            CycleButton cycle = CycleButton.create(rowLeft, eventY, 112, btnH, Text.literal(clipEventButtonLabel()),
+                    b -> cycleClipEvent(true), b -> cycleClipEvent(false));
+            this.clipEventButton = cycle;
+            this.addDrawableChild(cycle);
+            lastRowY = eventY;
+        }
+
+        this.listLeft = this.contentLeft + 8;
+        this.listRight = this.contentLeft + this.contentWidth - 8;
+        this.listTop = lastRowY + 28;
+        this.listBottom = this.height - Math.max(24, (int) (this.height * 0.04D));
+
+        refreshVideos();
+    }
+
+    /** Sort {@link #allVideos} according to the configured gallery sort mode. */
+    private void sortAllVideos() {
+        String mode = RecordableConfig.get().gallerySortMode;
+        Comparator<VideoMetadata> cmp;
+        switch (mode) {
+            case "oldest" -> cmp = Comparator.comparingLong((VideoMetadata m) -> m.modifiedMillis);
+            case "name_az" -> cmp = Comparator.comparing((VideoMetadata m) -> m.filename, String.CASE_INSENSITIVE_ORDER);
+            case "name_za" -> cmp = Comparator.comparing((VideoMetadata m) -> m.filename, String.CASE_INSENSITIVE_ORDER).reversed();
+            case "largest" -> cmp = Comparator.comparingLong((VideoMetadata m) -> m.sizeBytes).reversed();
+            case "smallest" -> cmp = Comparator.comparingLong((VideoMetadata m) -> m.sizeBytes);
+            case "longest" -> cmp = Comparator.comparingDouble((VideoMetadata m) -> m.durationSeconds).reversed();
+            case "shortest" -> cmp = Comparator.comparingDouble((VideoMetadata m) -> m.durationSeconds);
+            default -> cmp = Comparator.comparingLong((VideoMetadata m) -> m.modifiedMillis).reversed();
+        }
+        this.allVideos.sort(cmp);
+    }
+
+    private static String sortModeLabel(String mode) {
+        return switch (mode) {
+            case "oldest" -> "Oldest";
+            case "name_az" -> "A-Z";
+            case "name_za" -> "Z-A";
+            case "largest" -> "Largest";
+            case "smallest" -> "Smallest";
+            case "longest" -> "Longest";
+            case "shortest" -> "Shortest";
+            default -> "Newest";
+        };
+    }
+
+    private void cycleSortMode() {
+        cycleSortMode(true);
+    }
+
+    private void cycleSortMode(boolean forward) {
+        RecordableConfig config = RecordableConfig.get();
+        String[] modes = RecordableConfig.GALLERY_SORT_MODES;
+        int idx = 0;
+        for (int i = 0; i < modes.length; i++) {
+            if (modes[i].equals(config.gallerySortMode)) { idx = i; break; }
+        }
+        int step = forward ? 1 : -1;
+        config.gallerySortMode = modes[(idx + step + modes.length) % modes.length];
+        config.save();
+        sortAllVideos();
+        applyFilter();
+        this.init();
+    }
+
+    @Override
+    public void close() {
+        cancelDurationProbe();
+        cancelShareUpload();
+        clearThumbnails();
+        if (this.client != null) {
+            this.client.setScreen(this.parent);
+        }
+    }
+
+    private void cancelDurationProbe() {
+        durationProbeRunning.set(false);
+        ExecutorService exec = durationProber;
+        if (exec != null) {
+            exec.shutdownNow();
+            durationProber = null;
+        }
+    }
+
+    private void refreshVideos() {
+        cancelDurationProbe();
+        
+        // Show loading state immediately for responsiveness
+        this.allVideos.clear();
+        this.totalSizeBytes = 0L;
+        this.statusMessage = Text.translatable("screen.recordable.video_collection.loading");
+        this.statusIsError = false;
+        clearThumbnails();
+        applyFilter();
+
+        // Perform file scan in background to avoid blocking the main thread
+        CompletableFuture.runAsync(() -> {
+            List<VideoMetadata> scannedVideos = new ArrayList<>();
+            Map<Path, String> scannedClipEvents = new HashMap<>();
+            java.util.Set<String> scannedEventTypes = new java.util.LinkedHashSet<>();
+            long totalBytes = 0L;
+            Text errorMessage = null;
+            boolean isError = false;
+
+            try {
+                RecordableConfig config = RecordableConfig.get();
+                Path baseDir = config == null ? null : config.getOutputDirectory();
+                List<Path> scanRoots = new ArrayList<>();
+                if (baseDir != null) {
+                    if (this.clipsMode) {
+                        scanRoots.add(baseDir.resolve("clips"));
+                        scanRoots.add(baseDir.resolve("recording_auto_clips"));
+                    } else {
+                        scanRoots.add(baseDir);
+                    }
+                }
+
+                boolean scannedAnyDirectory = false;
+                for (Path scanDir : scanRoots) {
+                    if (scanDir == null || !Files.exists(scanDir) || !Files.isDirectory(scanDir)) {
+                        continue;
+                    }
+                    scannedAnyDirectory = true;
+                    try (Stream<Path> stream = this.clipsMode ? Files.walk(scanDir) : Files.list(scanDir)) {
+                        stream.filter(Files::isRegularFile)
+                                .filter(VideoCollectionScreen::isSupportedVideo)
+                                .forEach(path -> {
+                                    try {
+                                        VideoMetadata metadata = VideoMetadata.readQuick(path);
+                                        String clipEventType = classifyClipEvent(baseDir, path);
+                                        synchronized (scannedVideos) {
+                                            scannedVideos.add(metadata);
+                                            if (this.clipsMode) {
+                                                scannedClipEvents.put(path, clipEventType);
+                                                scannedEventTypes.add(clipEventType);
+                                            }
+                                        }
+                                    } catch (Throwable throwable) {
+                                        RecordableMod.LOGGER.warn("Skipping unreadable recording entry {}", path, throwable);
+                                    }
+                                });
+                    }
+                }
+
+                if (!scannedAnyDirectory) {
+                    errorMessage = Text.translatable(this.clipsMode
+                            ? "screen.recordable.video_collection.no_clips"
+                            : "screen.recordable.video_collection.no_recordings");
+                } else {
+                    for (VideoMetadata m : scannedVideos) {
+                        totalBytes += Math.max(0L, m.sizeBytes);
+                    }
+
+                    if (scannedVideos.isEmpty()) {
+                        errorMessage = Text.translatable(this.clipsMode
+                                ? "screen.recordable.video_collection.no_clips"
+                                : "screen.recordable.video_collection.no_recordings");
+                    }
+                }
+            } catch (Throwable throwable) {
+                RecordableMod.LOGGER.warn("Failed to refresh video collection.", throwable);
+                errorMessage = Text.translatable("screen.recordable.video_collection.refresh_failed");
+                isError = true;
+            }
+
+            // Update UI on main thread
+            final List<VideoMetadata> finalVideos = scannedVideos;
+            final Map<Path, String> finalClipEvents = scannedClipEvents;
+            final java.util.Set<String> finalEventTypes = scannedEventTypes;
+            final long finalBytes = totalBytes;
+            final Text finalMessage = errorMessage;
+            final boolean finalIsError = isError;
+            
+            MinecraftClient.getInstance().execute(() -> {
+                this.allVideos.clear();
+                this.allVideos.addAll(finalVideos);
+                this.clipEventByPath.clear();
+                this.clipEventByPath.putAll(finalClipEvents);
+                rebuildClipEventOptions(finalEventTypes);
+                this.totalSizeBytes = finalBytes;
+                this.statusMessage = finalMessage;
+                this.statusIsError = finalIsError;
+                
+                sortAllVideos();
+                applyFilter();
+                startDurationProbe();
+            });
+        });
+    }
+
+    /**
+     * Probes video durations in a single background thread, updating entries
+     * as results come in. The UI will show "..." until each duration resolves.
+     */
+    private void startDurationProbe() {
+        // Snapshot file paths that need probing
+        List<Path> needsProbe = new ArrayList<>();
+        for (VideoMetadata m : allVideos) {
+            if (m.durationSeconds <= 0D && m.file != null) {
+                needsProbe.add(m.file);
+            }
+        }
+        if (needsProbe.isEmpty()) return;
+
+        durationProbeRunning.set(true);
+        ExecutorService exec = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "recordable-duration-prober");
+            t.setDaemon(true);
+            return t;
+        });
+        durationProber = exec;
+
+        exec.submit(() -> {
+            for (Path path : needsProbe) {
+                if (!durationProbeRunning.get()) break;
+                try {
+                    VideoMetadata probed = VideoMetadata.probeDurationFor(path);
+                    if (probed != null && durationProbeRunning.get()) {
+                        // Schedule replacement on render thread
+                        MinecraftClient mc = MinecraftClient.getInstance();
+                        if (mc != null) {
+                            mc.execute(() -> replaceProbedEntry(path, probed));
+                        }
+                    }
+                } catch (Throwable t) {
+                    RecordableMod.LOGGER.debug("Background duration probe error for {}", path, t);
+                }
+            }
+            durationProbeRunning.set(false);
+        });
+    }
+
+    /** Replace an entry in the video lists after its duration was probed. */
+    private void replaceProbedEntry(Path file, VideoMetadata probed) {
+        replaceInList(allVideos, file, probed);
+        replaceInList(filteredVideos, file, probed);
+    }
+
+    private static void replaceInList(List<VideoMetadata> list, Path file, VideoMetadata replacement) {
+        for (int i = 0; i < list.size(); i++) {
+            VideoMetadata existing = list.get(i);
+            if (existing != null && existing.file != null && existing.file.equals(replacement.file)) {
+                list.set(i, replacement);
+                break;
+            }
+        }
+    }
+
+    private void applyFilter() {
+        String query = this.searchField == null ? "" : this.searchField.getText();
+        String normalized = query == null ? "" : query.trim().toLowerCase(Locale.ROOT);
+
+        this.filteredVideos.clear();
+        if (normalized.isBlank()) {
+            this.filteredVideos.addAll(this.allVideos);
+        } else {
+            for (VideoMetadata metadata : this.allVideos) {
+                if (metadata == null) {
+                    continue;
+                }
+                String haystack = (metadata.filename + " " + metadata.recordedAtDisplay).toLowerCase(Locale.ROOT);
+                boolean queryMatch = haystack.contains(normalized);
+                boolean eventMatch = !this.clipsMode || CLIP_EVENT_ALL.equals(this.selectedClipEvent)
+                        || this.selectedClipEvent.equals(this.clipEventByPath.get(metadata.file));
+                if (queryMatch && eventMatch) {
+                    this.filteredVideos.add(metadata);
+                }
+            }
+        }
+
+        clampScroll();
+    }
+
+    @Override
+    public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
+        int viewHeight = Math.max(0, this.listBottom - this.listTop);
+        int maxScroll = Math.max(0, this.filteredVideos.size() * ENTRY_HEIGHT - viewHeight);
+        if (maxScroll <= 0) {
+            return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount);
+        }
+
+        int delta = (int) Math.round(verticalAmount * -20.0D);
+        if (delta == 0) {
+            delta = verticalAmount > 0 ? -20 : 20;
+        }
+        this.scrollOffset = Math.max(0, Math.min(maxScroll, this.scrollOffset + delta));
+        return true;
+    }
+
+    @Override
+    public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        if (super.mouseClicked(mouseX, mouseY, button)) {
+            return true;
+        }
+        if (button == 0 && isOverScrollbar(mouseX, mouseY)) {
+            this.draggingScrollbar = true;
+            scrollToMouse(mouseY);
+            return true;
+        }
+        // Iterate top-most first so a drawer/flyout drawn last wins over anything beneath it.
+        for (int i = this.actionZones.size() - 1; i >= 0; i--) {
+            ActionZone zone = this.actionZones.get(i);
+            if (zone.contains(mouseX, mouseY)) {
+                zone.action.run();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public boolean mouseDragged(double mouseX, double mouseY, int button, double deltaX, double deltaY) {
+        if (this.draggingScrollbar && button == 0) {
+            scrollToMouse(mouseY);
+            return true;
+        }
+        return super.mouseDragged(mouseX, mouseY, button, deltaX, deltaY);
+    }
+
+    @Override
+    public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        if (button == 0 && this.draggingScrollbar) {
+            this.draggingScrollbar = false;
+            return true;
+        }
+        return super.mouseReleased(mouseX, mouseY, button);
+    }
+
+    /** True if the cursor is over the scrollbar track (and there is something to scroll). */
+    private boolean isOverScrollbar(double mouseX, double mouseY) {
+        int viewHeight = Math.max(0, this.listBottom - this.listTop);
+        int contentHeight = this.filteredVideos.size() * ENTRY_HEIGHT;
+        if (contentHeight <= viewHeight) {
+            return false;
+        }
+        int scrollbarLeft = this.listRight - 6;
+        int scrollbarRight = this.listRight;
+        return mouseX >= scrollbarLeft && mouseX <= scrollbarRight
+                && mouseY >= this.listTop && mouseY <= this.listBottom;
+    }
+
+    /** Map a vertical mouse position onto the scroll range so the thumb follows the cursor. */
+    private void scrollToMouse(double mouseY) {
+        int viewHeight = Math.max(1, this.listBottom - this.listTop);
+        int contentHeight = this.filteredVideos.size() * ENTRY_HEIGHT;
+        int maxScroll = Math.max(0, contentHeight - viewHeight);
+        if (maxScroll <= 0) {
+            return;
+        }
+        int thumbHeight = Math.max(24, (int) (viewHeight * (viewHeight / (double) contentHeight)));
+        int available = Math.max(1, viewHeight - thumbHeight);
+        double ratio = (mouseY - this.listTop - thumbHeight / 2.0) / available;
+        ratio = Math.max(0.0, Math.min(1.0, ratio));
+        this.scrollOffset = (int) Math.round(ratio * maxScroll);
+        clampScroll();
+    }
+
+    @Override
+    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        if (this.shareTarget != null && keyCode == 256) { // escape closes the drawer first, then the modal
+            if (this.shareRetentionDrawerOpen) {
+                this.shareRetentionDrawerOpen = false;
+            } else {
+                closeShareDialog();
+            }
+            return true;
+        }
+        if (this.searchField != null && this.searchField.isFocused()) {
+            return super.keyPressed(keyCode, scanCode, modifiers);
+        }
+
+        if (keyCode == 264) { // down
+            this.scrollOffset += ENTRY_HEIGHT;
+            clampScroll();
+            return true;
+        }
+        if (keyCode == 265) { // up
+            this.scrollOffset -= ENTRY_HEIGHT;
+            clampScroll();
+            return true;
+        }
+        return super.keyPressed(keyCode, scanCode, modifiers);
+    }
+
+    @Override
+    public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+        this.renderBackground(context, mouseX, mouseY, delta);
+
+        ThemeColors colors = ThemeEngine.get().colors();
+        ThemePreset preset = ThemeEngine.get().preset();
+
+        int panelLeft = this.listLeft - 8;
+        int panelRight = this.listRight + 8;
+        int panelTop = this.headerTop - 4;
+        int panelBottom = this.height - 8;
+
+        // Draw themed panel
+        if (preset == ThemePreset.CINEMA) {
+            ThemedPanel.drawFilmPanel(context, panelLeft, panelTop, panelRight, panelBottom);
+        } else {
+            ThemedPanel.drawPanel(context, panelLeft, panelTop, panelRight, panelBottom);
+        }
+
+        // Title with theme decoration
+        if (preset == ThemePreset.VHS) {
+            TypewriterText.renderFlickerText(context, this.textRenderer,
+                    "▶ " + this.title.getString(),
+                    this.width / 2 - this.textRenderer.getWidth("▶ " + this.title.getString()) / 2,
+                    panelTop + 6, colors.headerText);
+        } else if (preset == ThemePreset.CINEMA) {
+            context.drawCenteredTextWithShadow(this.textRenderer,
+                    "🎬 " + this.title.getString(),
+                    this.width / 2, panelTop + 6, colors.headerText);
+        } else {
+            context.drawCenteredTextWithShadow(this.textRenderer, this.title, this.width / 2, panelTop + 6, colors.headerText);
+        }
+
+        String summary = Text.translatable(
+                "screen.recordable.video_collection.summary",
+                Integer.toString(this.allVideos.size()),
+                formatSizeMb(this.totalSizeBytes)
+        ).getString();
+        RenderHelper.drawText(context, this.textRenderer,
+                Text.literal(fitTextToWidth(summary, Math.max(32, this.listRight - this.listLeft - 10))),
+                this.listLeft, panelTop + 6, colors.textMuted);
+
+        // Render widgets (buttons, search field) now, BEFORE the themed list and entries are drawn.
+        // In MC 1.20.4 Screen.render() repaints the vanilla background at its start, so it must run
+        // here (not at the end). Running it late painted the dirt background over every themed fill
+        // and thumbnail texture, leaving only the batched text visible.
+        super.render(context, mouseX, mouseY, delta);
+
+        // List area with themed borders
+        context.fill(this.listLeft, this.listTop, this.listRight, this.listBottom, colors.sectionBackground);
+        context.fill(this.listLeft, this.listTop, this.listRight, this.listTop + 1, colors.accent);
+        context.fill(this.listLeft, this.listBottom - 1, this.listRight, this.listBottom, colors.panelBorder);
+
+        // Film sprockets on list edges for Cinema theme
+        if (preset == ThemePreset.CINEMA) {
+            VhsEffectsRenderer.renderSprocketHoles(context, this.listLeft - 6, this.listTop, this.listBottom, colors.accent);
+            VhsEffectsRenderer.renderSprocketHoles(context, this.listRight + 1, this.listTop, this.listBottom, colors.accent);
+        }
+
+        this.actionZones.clear();
+
+        if (this.filteredVideos.isEmpty()) {
+            Text noItemsText = Text.translatable("screen.recordable.video_collection.no_recordings");
+            context.drawCenteredTextWithShadow(this.textRenderer, noItemsText, this.width / 2,
+                    this.listTop + Math.max(8, (this.listBottom - this.listTop) / 2 - 6), colors.textMuted);
+            // Show reel loading animation when empty
+            if (preset == ThemePreset.VHS || preset == ThemePreset.CINEMA) {
+                ThemedPanel.drawReelLoading(context, this.width / 2, this.listTop + (this.listBottom - this.listTop) / 2 + 16, 12);
+            }
+        } else {
+            renderVideoEntries(context, mouseX, mouseY);
+        }
+
+        if (this.statusMessage != null) {
+            RenderHelper.drawText(context, this.textRenderer,
+                    Text.literal(fitTextToWidth(this.statusMessage.getString(), Math.max(32, this.listRight - this.listLeft - 10))),
+                    this.listLeft, this.height - 18,
+                    this.statusIsError ? colors.textError : colors.textMuted);
+        }
+
+        // Draw the Share host-choice overlay on top of everything else (including widgets).
+        // When open, it takes over click handling (only its buttons register action zones).
+        // Raise the whole modal by z=400 (the same depth vanilla tooltips use) so it draws
+        // above the batched list text. In 1.20.4 a single draw() flush is not enough because
+        // the text layer sorts above the gui-fill layer within one flush; the z offset makes
+        // depth testing keep the modal in front regardless of flush order.
+        if (this.shareTarget != null) {
+            context.getMatrices().push();
+            context.getMatrices().translate(0, 0, 400);
+            renderShareOverlay(context, mouseX, mouseY);
+            context.getMatrices().pop();
+        }
+    }
+
+    /**
+     * Modal overlay letting the user pick a host to upload the selected recording to.
+     * Catbox is permanent (200 MB limit); Litterbox is temporary (1 GB limit, expires in 72h).
+     */
+    private void renderShareOverlay(DrawContext context, int mouseX, int mouseY) {
+        ThemeColors tc = ThemeEngine.get().colors();
+
+        // Flush the batched text of the underlying list (filenames, Play/Folder/Delete...)
+        // to the framebuffer BEFORE drawing the modal. Minecraft batches all drawText into
+        // a buffer flushed at frame end, so without this flush the list text would paint on
+        // top of the modal dim and panel (the reported bleed-through).
+        context.draw();
+
+        // Dim the whole screen behind the modal (E0 = ~88% opacity for strong visual separation).
+        context.fill(0, 0, this.width, this.height, 0xE0000000);
+
+        int panelWidth = Math.min(380, this.width - 20);
+        int panelInnerPadding = 12;
+        int btnLeft = 0;
+        int btnWidth = panelWidth - (panelInnerPadding * 2);
+        int textWrapWidth = Math.max(120, btnWidth - 4);
+
+        int recordableDescLines = wrappedLineCount(Text.translatable("screen.recordable.video_collection.share_recordable_desc1"), textWrapWidth)
+                + wrappedLineCount(Text.translatable("screen.recordable.video_collection.share_recordable_desc2"), textWrapWidth);
+        int litterboxDescLines = wrappedLineCount(Text.translatable("screen.recordable.video_collection.share_litterbox_desc1"), textWrapWidth)
+                + wrappedLineCount(Text.translatable("screen.recordable.video_collection.share_litterbox_desc2"), textWrapWidth);
+        int noteLines = wrappedLineCount(Text.translatable("screen.recordable.video_collection.share_note_line1"), textWrapWidth)
+                + wrappedLineCount(Text.translatable("screen.recordable.video_collection.share_note_line2"), textWrapWidth);
+
+        int dynamicContentHeight = 64 // title + prompt area
+                + 16 + (recordableDescLines * 11) + 8
+                + 16 + (litterboxDescLines * 11) + 10
+                + (noteLines * 11) + 24;
+        int panelHeight = Math.max(232, dynamicContentHeight + 18);
+
+        int px = (this.width - panelWidth) / 2;
+        int py = (this.height - panelHeight) / 2;
+
+        // Force an opaque panel so list text behind it does not bleed through at high GUI scales.
+        context.fill(px, py, px + panelWidth, py + panelHeight, 0xF0120618);
+        context.fill(px, py, px + panelWidth, py + 1, tc.accent);
+        context.fill(px, py + panelHeight - 1, px + panelWidth, py + panelHeight, tc.panelBorder);
+        context.fill(px, py, px + 1, py + panelHeight, tc.panelBorder);
+        context.fill(px + panelWidth - 1, py, px + panelWidth, py + panelHeight, tc.panelBorder);
+
+        int centerX = px + panelWidth / 2;
+        btnLeft = px + panelInnerPadding;
+        String fileName = this.shareTarget.filename == null
+                ? Text.translatable("screen.recordable.video_collection.share").getString()
+                : this.shareTarget.filename;
+        context.drawCenteredTextWithShadow(this.textRenderer,
+                Text.translatable("screen.recordable.video_collection.share_title", ellipsize(fileName, 40)),
+                centerX, py + 8, tc.headerText);
+        context.drawCenteredTextWithShadow(this.textRenderer,
+                Text.translatable("screen.recordable.video_collection.share_prompt"),
+                centerX, py + 22, tc.textSecondary);
+
+        // Clear list/entry click zones so only the modal is interactive while it is open.
+        this.actionZones.clear();
+
+        // Keep the success state visible for 1 second before auto-closing the overlay.
+        if (!this.sharing && this.shareOverlayUntilMs > 0L) {
+            if (Util.getMeasuringTimeMs() >= this.shareOverlayUntilMs) {
+                closeShareDialog();
+                return;
+            }
+            context.drawCenteredTextWithShadow(this.textRenderer,
+                    this.shareOverlayMessage == null
+                            ? Text.translatable("screen.recordable.video_collection.share_copied")
+                            : this.shareOverlayMessage,
+                    centerX, py + panelHeight / 2 - 8, tc.textPrimary);
+            int noteY = py + panelHeight - 46;
+            noteY = drawWrappedText(context, Text.translatable("screen.recordable.video_collection.share_note_line1"),
+                    btnLeft + 2, noteY, textWrapWidth, tc.textMuted);
+            drawWrappedText(context, Text.translatable("screen.recordable.video_collection.share_note_line2"),
+                    btnLeft + 2, noteY, textWrapWidth, tc.textMuted);
+            return;
+        }
+
+        if (this.sharing) {
+            int percent = Math.max(0, Math.min(100, VideoShareUploader.lastProgressPercent));
+            long uploaded = VideoShareUploader.lastUploadedBytes;
+            long total = VideoShareUploader.lastTotalBytes;
+
+            context.drawCenteredTextWithShadow(this.textRenderer,
+                    Text.translatable("screen.recordable.video_collection.share_uploading",
+                            Text.translatable("screen.recordable.video_collection.share").getString()),
+                    centerX, py + panelHeight / 2 - 20, tc.textPrimary);
+
+            int barWidth = panelWidth - (panelInnerPadding * 2) - 4;
+            int barHeight = 12;
+            int barLeft = centerX - barWidth / 2;
+            int barTop = py + panelHeight / 2 - 4;
+
+            context.fill(barLeft, barTop, barLeft + barWidth, barTop + barHeight, 0x40000000);
+            context.fill(barLeft, barTop, barLeft + barWidth, barTop + 1, tc.panelBorder);
+            context.fill(barLeft, barTop + barHeight - 1, barLeft + barWidth, barTop + barHeight, tc.panelBorder);
+            context.fill(barLeft, barTop, barLeft + 1, barTop + barHeight, tc.panelBorder);
+            context.fill(barLeft + barWidth - 1, barTop, barLeft + barWidth, barTop + barHeight, tc.panelBorder);
+
+            int fillWidth = (int) Math.round((barWidth - 2) * (percent / 100.0));
+            if (fillWidth > 0) {
+                context.fill(barLeft + 1, barTop + 1, barLeft + 1 + fillWidth, barTop + barHeight - 1, tc.accent);
+            }
+
+            String label = total > 0L
+                    ? percent + "%  (" + formatSize(uploaded) + " / " + formatSize(total) + ")"
+                    : percent + "%";
+            context.drawCenteredTextWithShadow(this.textRenderer, Text.literal(label),
+                    centerX, barTop + barHeight + 6, tc.textSecondary);
+            return;
+        }
+
+        // Record-able server option. Clicking it opens a drawer of retention choices.
+        int recordableY = py + 40;
+        drawActionButton(context, mouseX, mouseY, btnLeft, recordableY, btnWidth, 16,
+                Text.translatable("screen.recordable.video_collection.share_recordable"),
+                () -> this.shareRetentionDrawerOpen = !this.shareRetentionDrawerOpen);
+        int y = drawWrappedText(context, Text.translatable("screen.recordable.video_collection.share_recordable_desc1"),
+                btnLeft + 2, recordableY + 20, textWrapWidth, tc.textSecondary);
+        y = drawWrappedText(context, Text.translatable("screen.recordable.video_collection.share_recordable_desc2"),
+                btnLeft + 2, y, textWrapWidth, tc.textSecondary);
+
+        // Litterbox option.
+        int litterY = y + 8;
+        drawActionButton(context, mouseX, mouseY, btnLeft, litterY, btnWidth, 16,
+                Text.translatable("screen.recordable.video_collection.share_litterbox"),
+                () -> shareTo(this.shareTarget, VideoShareUploader.Host.LITTERBOX));
+        y = drawWrappedText(context, Text.translatable("screen.recordable.video_collection.share_litterbox_desc1"),
+                btnLeft + 2, litterY + 20, textWrapWidth, tc.textSecondary);
+        y = drawWrappedText(context, Text.translatable("screen.recordable.video_collection.share_litterbox_desc2"),
+                btnLeft + 2, y, textWrapWidth, tc.textSecondary);
+
+        y += 8;
+        y = drawWrappedText(context, Text.translatable("screen.recordable.video_collection.share_note_line1"),
+                btnLeft + 2, y, textWrapWidth, tc.textMuted);
+        y = drawWrappedText(context, Text.translatable("screen.recordable.video_collection.share_note_line2"),
+                btnLeft + 2, y, textWrapWidth, tc.textMuted);
+
+        int cancelY = Math.min(py + panelHeight - 18, y + 6);
+        drawActionButton(context, mouseX, mouseY, centerX - 30, cancelY, 60, 14,
+                Text.translatable("screen.recordable.video_collection.share_cancel"), this::closeShareDialog);
+
+        // Retention drawer: rendered last so it sits on top of everything else.
+        if (this.shareRetentionDrawerOpen) {
+            renderRetentionDrawer(context, mouseX, mouseY, px, panelWidth, recordableY, btnLeft, btnWidth);
+        }
+    }
+
+    /**
+     * Draws the 7 / 30 / 60 day retention drawer just to the right of the re.share-abl.ink
+     * button. If there is not enough room on the right (small windows) it flips to the left
+     * so it never runs off-screen. Selecting an option starts the upload with that retention.
+     */
+    private void renderRetentionDrawer(DrawContext context, int mouseX, int mouseY,
+                                       int px, int panelWidth, int recordableY, int btnLeft, int btnWidth) {
+        ThemeColors tc = ThemeEngine.get().colors();
+        int drawerW = 66;
+        int drawerBtnH = 16;
+        int drawerGap = 3;
+        int pad = 3;
+
+        int buttonRight = btnLeft + btnWidth;
+        int drawerX = buttonRight + 6;
+        // Flip to the left of the button if the drawer would run past the screen edge.
+        if (drawerX + drawerW + pad > this.width - 2) {
+            drawerX = btnLeft - drawerW - 6;
+        }
+        // If it still does not fit (very narrow window), tuck it inside the right edge.
+        if (drawerX < 2) {
+            drawerX = Math.max(2, px + panelWidth - drawerW - 6);
+        }
+
+        int drawerTop = recordableY - pad;
+        int drawerHeight = pad * 2 + drawerBtnH * 3 + drawerGap * 2;
+
+        // Drawer container background and border so it reads as a flyout panel.
+        context.fill(drawerX - pad, drawerTop, drawerX + drawerW + pad, drawerTop + drawerHeight, tc.panelBackground);
+        context.fill(drawerX - pad, drawerTop, drawerX + drawerW + pad, drawerTop + 1, tc.accent);
+        context.fill(drawerX - pad, drawerTop + drawerHeight - 1, drawerX + drawerW + pad, drawerTop + drawerHeight, tc.panelBorder);
+        context.fill(drawerX - pad, drawerTop, drawerX - pad + 1, drawerTop + drawerHeight, tc.panelBorder);
+        context.fill(drawerX + drawerW + pad - 1, drawerTop, drawerX + drawerW + pad, drawerTop + drawerHeight, tc.panelBorder);
+
+        int[] days = VideoShareUploader.RETENTION_DAY_OPTIONS;
+        for (int i = 0; i < days.length; i++) {
+            final int retentionDays = days[i];
+            int by = recordableY + i * (drawerBtnH + drawerGap);
+            drawActionButton(context, mouseX, mouseY, drawerX, by, drawerW, drawerBtnH,
+                    Text.literal(retentionDays + " days"),
+                    () -> {
+                        this.shareRetentionDrawerOpen = false;
+                        shareTo(this.shareTarget, VideoShareUploader.Host.RECORDABLE, retentionDays);
+                    });
+        }
+    }
+
+    private void openShareDialog(VideoMetadata metadata) {
+        if (metadata == null || metadata.file == null || this.sharing) {
+            return;
+        }
+        this.shareTarget = metadata;
+        this.shareRetentionDrawerOpen = false;
+        this.shareOverlayMessage = null;
+        this.shareOverlayUntilMs = 0L;
+    }
+
+    private void closeShareDialog() {
+        if (this.sharing) {
+            return;
+        }
+        this.shareTarget = null;
+        this.shareRetentionDrawerOpen = false;
+        this.shareOverlayMessage = null;
+        this.shareOverlayUntilMs = 0L;
+    }
+
+    /** Kicks off a background upload of the recording to the chosen host. */
+    private void shareTo(VideoMetadata metadata, VideoShareUploader.Host host) {
+        shareTo(metadata, host, VideoShareUploader.DEFAULT_RETENTION_DAYS);
+    }
+
+    /** Kicks off a background upload of the recording to the chosen host with a retention choice. */
+    private void shareTo(VideoMetadata metadata, VideoShareUploader.Host host, int retentionDays) {
+        if (metadata == null || metadata.file == null || host == null || this.sharing) {
+            return;
+        }
+        this.shareRetentionDrawerOpen = false;
+        final Path file = metadata.file;
+        this.sharing = true;
+        this.shareOverlayMessage = null;
+        this.shareOverlayUntilMs = 0L;
+        setStatus(Text.translatable("screen.recordable.video_collection.share_uploading", host.displayName), false);
+
+        ExecutorService exec = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "recordable-share-upload");
+            t.setDaemon(true);
+            return t;
+        });
+        this.shareUploader = exec;
+        exec.submit(() -> {
+            boolean ok;
+            String result;
+            try {
+                result = VideoShareUploader.upload(file, host, retentionDays);
+                ok = result != null && result.startsWith("http");
+            } catch (Throwable throwable) {
+                RecordableMod.LOGGER.warn("Share upload failed for {}", file, throwable);
+                result = throwable.getMessage() == null ? throwable.toString() : throwable.getMessage();
+                ok = false;
+            }
+            final boolean fOk = ok;
+            final String fResult = result;
+            MinecraftClient mc = MinecraftClient.getInstance();
+            if (mc != null) {
+                mc.execute(() -> onShareComplete(fOk, fResult));
+            }
+        });
+    }
+
+    /** Runs on the render thread once an upload finishes: copies the link and updates status. */
+    private void onShareComplete(boolean ok, String result) {
+        this.sharing = false;
+        cancelShareUpload();
+        if (ok) {
+            if (this.client != null && this.client.keyboard != null) {
+                try {
+                    this.client.keyboard.setClipboard(result);
+                } catch (Throwable throwable) {
+                    RecordableMod.LOGGER.debug("Could not copy share link to clipboard.", throwable);
+                }
+            }
+            this.shareOverlayMessage = Text.translatable("screen.recordable.video_collection.share_copied");
+            this.shareOverlayUntilMs = Util.getMeasuringTimeMs() + 1000L;
+            setStatus(Text.translatable("screen.recordable.video_collection.share_copied"), false);
+        } else {
+            this.shareTarget = null;
+            this.shareOverlayMessage = null;
+            this.shareOverlayUntilMs = 0L;
+            setStatus(Text.translatable("screen.recordable.video_collection.share_failed",
+                    result == null ? "" : result), true);
+        }
+    }
+
+    private void cancelShareUpload() {
+        ExecutorService exec = this.shareUploader;
+        if (exec != null) {
+            exec.shutdown();
+            this.shareUploader = null;
+        }
+    }
+
+    private static String ellipsize(String text, int max) {
+        if (text == null) {
+            return "";
+        }
+        return text.length() > max ? text.substring(0, Math.max(0, max - 3)) + "..." : text;
+    }
+
+    private String fitTextToWidth(String text, int maxWidth) {
+        if (text == null || maxWidth <= 8) {
+            return "";
+        }
+        if (this.textRenderer.getWidth(text) <= maxWidth) {
+            return text;
+        }
+        int trimmedWidth = Math.max(1, maxWidth - this.textRenderer.getWidth("..."));
+        return this.textRenderer.trimToWidth(text, trimmedWidth) + "...";
+    }
+
+    private String classifyClipEvent(Path baseDir, Path filePath) {
+        if (!this.clipsMode || baseDir == null || filePath == null) {
+            return CLIP_EVENT_ALL;
+        }
+        try {
+            Path clipsRoot = baseDir.resolve("clips");
+            if (filePath.startsWith(clipsRoot)) {
+                Path relative = clipsRoot.relativize(filePath);
+                if (relative.getNameCount() >= 2) {
+                    String segment = relative.getName(0).toString().trim();
+                    if (!segment.isEmpty()) {
+                        return segment.toLowerCase(Locale.ROOT);
+                    }
+                }
+            }
+            Path legacyRoot = baseDir.resolve("recording_auto_clips");
+            if (filePath.startsWith(legacyRoot)) {
+                return "legacy";
+            }
+        } catch (Throwable ignored) {
+        }
+        return "other";
+    }
+
+    private void rebuildClipEventOptions(java.util.Set<String> discoveredEventTypes) {
+        this.clipEventOptions.clear();
+        this.clipEventOptions.add(CLIP_EVENT_ALL);
+        for (String knownType : DEFAULT_CLIP_EVENT_TYPES) {
+            if (!this.clipEventOptions.contains(knownType)) {
+                this.clipEventOptions.add(knownType);
+            }
+        }
+        if (discoveredEventTypes != null && !discoveredEventTypes.isEmpty()) {
+            List<String> sorted = new ArrayList<>();
+            for (String value : discoveredEventTypes) {
+                if (value == null || value.isBlank() || CLIP_EVENT_ALL.equals(value)) {
+                    continue;
+                }
+                if (!this.clipEventOptions.contains(value)) {
+                    sorted.add(value);
+                }
+            }
+            sorted.sort(String.CASE_INSENSITIVE_ORDER);
+            this.clipEventOptions.addAll(sorted);
+        }
+        syncSelectedClipEvent();
+        updateClipEventButtonLabel();
+    }
+
+    private void syncSelectedClipEvent() {
+        if (this.initialClipEvent != null && this.clipEventOptions.contains(this.initialClipEvent)) {
+            this.selectedClipEvent = this.initialClipEvent;
+            return;
+        }
+        if (this.selectedClipEvent == null || !this.clipEventOptions.contains(this.selectedClipEvent)) {
+            this.selectedClipEvent = CLIP_EVENT_ALL;
+        }
+    }
+
+    private void cycleClipEvent(boolean forward) {
+        if (!this.clipsMode || this.clipEventOptions.isEmpty()) {
+            return;
+        }
+        int index = this.clipEventOptions.indexOf(this.selectedClipEvent);
+        if (index < 0) {
+            index = 0;
+        }
+        int step = forward ? 1 : -1;
+        int next = (index + step + this.clipEventOptions.size()) % this.clipEventOptions.size();
+        this.selectedClipEvent = this.clipEventOptions.get(next);
+        updateClipEventButtonLabel();
+        applyFilter();
+    }
+
+    private void updateClipEventButtonLabel() {
+        if (this.clipEventButton != null) {
+            this.clipEventButton.setMessage(Text.literal(clipEventButtonLabel()));
+        }
+    }
+
+    private String clipEventButtonLabel() {
+        return "Event: " + clipEventDisplayName(this.selectedClipEvent);
+    }
+
+    private static String clipEventDisplayName(String eventType) {
+        if (eventType == null || CLIP_EVENT_ALL.equals(eventType)) {
+            return "All";
+        }
+        if ("legacy".equals(eventType)) {
+            return "Legacy";
+        }
+        if ("other".equals(eventType)) {
+            return "Other";
+        }
+        String normalized = eventType.trim();
+        if (normalized.isEmpty()) {
+            return "Other";
+        }
+        StringBuilder out = new StringBuilder(normalized.length());
+        boolean upper = true;
+        for (int i = 0; i < normalized.length(); i++) {
+            char ch = normalized.charAt(i);
+            if (ch == '_' || ch == '-') {
+                out.append(' ');
+                upper = true;
+                continue;
+            }
+            out.append(upper ? Character.toUpperCase(ch) : ch);
+            upper = ch == ' ';
+        }
+        return out.toString();
+    }
+
+    private int wrappedLineCount(Text text, int width) {
+        if (text == null) {
+            return 0;
+        }
+        return Math.max(1, this.textRenderer.wrapLines(text, Math.max(32, width)).size());
+    }
+
+    private int drawWrappedText(DrawContext context, Text text, int x, int y, int width, int color) {
+        if (text == null) {
+            return y;
+        }
+        int cursorY = y;
+        for (var line : this.textRenderer.wrapLines(text, Math.max(32, width))) {
+            context.drawText(this.textRenderer, line, x, cursorY, color, false);
+            cursorY += 11;
+        }
+        return cursorY;
+    }
+
+    private void renderVideoEntries(DrawContext context, int mouseX, int mouseY) {
+        int viewHeight = Math.max(1, this.listBottom - this.listTop);
+        int firstIndex = Math.max(0, this.scrollOffset / ENTRY_HEIGHT);
+        int lastIndexExclusive = Math.min(this.filteredVideos.size(), firstIndex + (viewHeight / ENTRY_HEIGHT) + 3);
+        int y = this.listTop - (this.scrollOffset % ENTRY_HEIGHT);
+
+        for (int index = firstIndex; index < lastIndexExclusive; index++) {
+            VideoMetadata metadata = this.filteredVideos.get(index);
+            int entryTop = y + (index - firstIndex) * ENTRY_HEIGHT;
+            int entryBottom = entryTop + ENTRY_HEIGHT - 2;
+            if (entryTop < this.listTop || entryBottom > this.listBottom) {
+                continue;
+            }
+
+            renderEntry(context, metadata, entryTop, entryBottom, mouseX, mouseY);
+        }
+
+        renderScrollBar(context, viewHeight);
+    }
+
+    private void renderEntry(DrawContext context, VideoMetadata metadata, int top, int bottom, int mouseX, int mouseY) {
+        if (metadata == null) {
+            return;
+        }
+
+        ThemeColors tc = ThemeEngine.get().colors();
+        int accent = tc.accent;
+        boolean hovered = mouseY >= top && mouseY <= bottom && mouseX >= this.listLeft && mouseX <= this.listRight;
+        int background = hovered ? tc.panelBackground : ThemeEngine.lerpColor(tc.panelBackground, 0xFF000000, 0.3f);
+        context.fill(this.listLeft + 2, top, this.listRight - 2, bottom, background);
+        // Accent left-edge on hover
+        if (hovered) {
+            context.fill(this.listLeft + 2, top, this.listLeft + 4, bottom, accent);
+        }
+
+        int thumbLeft = this.listLeft + 6;
+        int thumbTop = top + 5;
+        int thumbWidth = 74;
+        int thumbHeight = 40;
+
+        context.fill(thumbLeft, thumbTop, thumbLeft + thumbWidth, thumbTop + thumbHeight, tc.panelBackground);
+        context.fill(thumbLeft, thumbTop, thumbLeft + thumbWidth, thumbTop + 1, tc.panelBorder);
+        context.fill(thumbLeft, thumbTop + thumbHeight - 1, thumbLeft + thumbWidth, thumbTop + thumbHeight, tc.panelBorder);
+
+        boolean renderedThumb = drawThumbnail(context, metadata, thumbLeft + 1, thumbTop + 1, thumbWidth - 2, thumbHeight - 2);
+        if (!renderedThumb) {
+            context.fill(thumbLeft + 8, thumbTop + 7, thumbLeft + 66, thumbTop + 33, tc.sectionHover);
+            context.drawCenteredTextWithShadow(this.textRenderer, Text.literal("VIDEO"), thumbLeft + thumbWidth / 2, thumbTop + 15, accent);
+        }
+
+        boolean isProtected = StorageManager.isProtected(RecordableConfig.get(), metadata.filename);
+
+        int buttonsRight = this.listRight - 6;
+        int col3 = buttonsRight - BUTTON_WIDTH;
+        int col2 = col3 - 5 - BUTTON_WIDTH;
+        int col1 = col2 - 5 - BUTTON_WIDTH;
+
+        int textX = thumbLeft + thumbWidth + 8;
+        int textMaxWidth = Math.max(40, (col1 - 8) - textX);
+        String displayName = (isProtected ? "🔒 " : "") + metadata.filename;
+        RenderHelper.drawText(context, this.textRenderer, Text.literal(fitTextToWidth(displayName, textMaxWidth)), textX, top + 4,
+                isProtected ? tc.accent : tc.textPrimary);
+        String sizeDuration = Text.translatable("screen.recordable.video_collection.meta.size_duration",
+                metadata.sizeDisplay, metadata.durationDisplay).getString();
+        RenderHelper.drawText(context, this.textRenderer, Text.literal(fitTextToWidth(sizeDuration, textMaxWidth)), textX, top + 17, tc.textSecondary);
+        String recordedAt = Text.translatable("screen.recordable.video_collection.meta.recorded_at",
+                metadata.recordedAtDisplay).getString();
+        RenderHelper.drawText(context, this.textRenderer, Text.literal(fitTextToWidth(recordedAt, textMaxWidth)), textX, top + 29, tc.textSecondary);
+        int row1 = top + 5;
+        int row2 = top + 24;
+        int row3 = top + 43;
+
+        // Row 1: primary view actions next to the thumbnail.
+        drawActionButton(context, mouseX, mouseY, col1, row1, BUTTON_WIDTH, BUTTON_HEIGHT,
+                Text.translatable("screen.recordable.video_collection.play"), () -> playInGame(metadata.file));
+        if (PlatformUtils.isAndroid()) {
+            // The launcher sandbox cannot open a folder in an external app, so
+            // show a greyed, non-clickable label. Recordings are auto-saved to
+            // the gallery (Movies/Record-able) instead.
+            drawDisabledActionButton(context, col2, row1, BUTTON_WIDTH, BUTTON_HEIGHT,
+                    Text.translatable("screen.recordable.video_collection.open_folder"));
+        } else {
+            drawActionButton(context, mouseX, mouseY, col2, row1, BUTTON_WIDTH, BUTTON_HEIGHT,
+                    Text.translatable("screen.recordable.video_collection.open_folder"), () -> openContainingFolder(metadata.file));
+        }
+        // Row 2: protection and delete.
+        drawActionButton(context, mouseX, mouseY, col1, row2, BUTTON_WIDTH, BUTTON_HEIGHT,
+                Text.translatable(isProtected
+                        ? "screen.recordable.video_collection.unprotect"
+                        : "screen.recordable.video_collection.protect"),
+                () -> toggleProtect(metadata));
+        drawActionButton(context, mouseX, mouseY, col2, row2, BUTTON_WIDTH, BUTTON_HEIGHT,
+                Text.translatable("screen.recordable.video_collection.delete"), () -> confirmDelete(metadata.file));
+        // Row 3: copy path and share sit below the other actions to avoid horizontal clutter.
+        drawActionButton(context, mouseX, mouseY, col1, row3, BUTTON_WIDTH, BUTTON_HEIGHT,
+                Text.translatable("screen.recordable.video_collection.copy_path"), () -> copyPath(metadata.file));
+        drawActionButton(context, mouseX, mouseY, col2, row3, BUTTON_WIDTH, BUTTON_HEIGHT,
+                Text.translatable("screen.recordable.video_collection.share"), () -> openShareDialog(metadata));
+    }
+
+    /** Toggle the protected flag for a recording (protected files cannot be deleted). */
+    private void toggleProtect(VideoMetadata metadata) {
+        if (metadata == null || metadata.filename == null) {
+            return;
+        }
+        try {
+            StorageManager.toggleProtected(RecordableConfig.get(), metadata.filename);
+            boolean nowProtected = StorageManager.isProtected(RecordableConfig.get(), metadata.filename);
+            // Cancel any pending delete confirmation when protecting a file.
+            if (nowProtected && metadata.file != null && metadata.file.equals(this.deleteConfirmPath)) {
+                this.deleteConfirmPath = null;
+                this.deleteConfirmUntil = 0L;
+            }
+            setStatus(Text.translatable(nowProtected
+                    ? "screen.recordable.video_collection.protected"
+                    : "screen.recordable.video_collection.unprotected", metadata.filename), false);
+        } catch (Throwable throwable) {
+            RecordableMod.LOGGER.warn("Failed to toggle protection for {}", metadata.filename, throwable);
+        }
+    }
+
+    private boolean drawThumbnail(DrawContext context, VideoMetadata metadata, int x, int y, int width, int height) {
+        if (metadata.thumbnailPath == null || !Files.exists(metadata.thumbnailPath)) {
+            return false;
+        }
+
+        ThumbnailTexture texture = thumbnailCache.get(metadata.thumbnailPath);
+        if (texture == null) {
+            texture = loadThumbnailTexture(metadata.thumbnailPath);
+            if (texture != null) {
+                thumbnailCache.put(metadata.thumbnailPath, texture);
+            }
+        }
+
+        if (texture == null || texture.identifier == null) {
+            return false;
+        }
+
+        try {
+            context.drawTexture(texture.identifier, x, y, 0.0F, 0.0F, width, height, width, height);
+            return true;
+        } catch (Throwable throwable) {
+            RecordableMod.LOGGER.debug("Failed to draw thumbnail texture for {}", metadata.thumbnailPath, throwable);
+            return false;
+        }
+    }
+
+    private ThumbnailTexture loadThumbnailTexture(Path thumbnailPath) {
+        MinecraftClient client = this.client == null ? MinecraftClient.getInstance() : this.client;
+        if (client == null || client.getTextureManager() == null) {
+            return null;
+        }
+
+        try {
+            if (!Files.exists(thumbnailPath) || !Files.isReadable(thumbnailPath)) {
+                RecordableMod.LOGGER.debug("Thumbnail path is missing/unreadable: {}", thumbnailPath);
+                return null;
+            }
+            NativeImage image;
+            try (java.io.InputStream stream = Files.newInputStream(thumbnailPath)) {
+                image = NativeImage.read(stream);
+            }
+            NativeImageBackedTexture nativeTexture = new NativeImageBackedTexture(image);
+            String idSuffix = Integer.toHexString(thumbnailPath.toAbsolutePath().toString().hashCode());
+            Identifier id = dev.recordable.VersionHelper.id(RecordableMod.MOD_ID, "thumb/" + idSuffix);
+            client.getTextureManager().registerTexture(id, nativeTexture);
+            return new ThumbnailTexture(id, nativeTexture);
+        } catch (Throwable throwable) {
+            RecordableMod.LOGGER.debug("Failed to load thumbnail texture from {}", thumbnailPath, throwable);
+            return null;
+        }
+    }
+
+    private void clearThumbnails() {
+        MinecraftClient client = this.client == null ? MinecraftClient.getInstance() : this.client;
+        for (ThumbnailTexture texture : this.thumbnailCache.values()) {
+            if (texture == null) {
+                continue;
+            }
+            try {
+                if (client != null && client.getTextureManager() != null && texture.identifier != null) {
+                    client.getTextureManager().destroyTexture(texture.identifier);
+                }
+                if (texture.texture != null) {
+                    texture.texture.close();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        this.thumbnailCache.clear();
+    }
+
+    private void drawActionButton(DrawContext context,
+                                  int mouseX,
+                                  int mouseY,
+                                  int x,
+                                  int y,
+                                  int width,
+                                  int height,
+                                  Text label,
+                                  Runnable action) {
+        ThemeColors tc = ThemeEngine.get().colors();
+        int accent = tc.accent;
+        boolean hovered = mouseX >= x && mouseX < x + width && mouseY >= y && mouseY < y + height;
+        int fill = hovered ? tc.sectionHover : tc.sectionBackground;
+        context.fill(x, y, x + width, y + height, fill);
+        context.fill(x, y, x + width, y + 1, hovered ? accent : tc.panelBorder);
+        context.fill(x, y + height - 1, x + width, y + height, tc.panelBorder);
+        context.fill(x, y, x + 1, y + height, tc.panelBorder);
+        context.fill(x + width - 1, y, x + width, y + height, tc.panelBorder);
+        context.drawCenteredTextWithShadow(this.textRenderer, label, x + width / 2, y + 3, hovered ? tc.textPrimary : tc.textSecondary);
+        this.actionZones.add(new ActionZone(x, y, x + width, y + height, action));
+    }
+
+    // Draws a greyed-out, non-interactive label in place of an action button.
+    // Used on Android for "Open Folder", which cannot work from the launcher
+    // sandbox; no click zone is registered so the label does nothing.
+    private void drawDisabledActionButton(DrawContext context,
+                                          int x,
+                                          int y,
+                                          int width,
+                                          int height,
+                                          Text label) {
+        ThemeColors tc = ThemeEngine.get().colors();
+        context.fill(x, y, x + width, y + height, tc.sectionBackground);
+        context.fill(x, y, x + width, y + 1, tc.panelBorder);
+        context.fill(x, y + height - 1, x + width, y + height, tc.panelBorder);
+        context.fill(x, y, x + 1, y + height, tc.panelBorder);
+        context.fill(x + width - 1, y, x + width, y + height, tc.panelBorder);
+        context.drawCenteredTextWithShadow(this.textRenderer, label, x + width / 2, y + 3, tc.textMuted);
+    }
+
+    private void renderScrollBar(DrawContext context, int viewHeight) {
+        int contentHeight = this.filteredVideos.size() * ENTRY_HEIGHT;
+        if (contentHeight <= viewHeight) {
+            return;
+        }
+
+        ThemeColors tc = ThemeEngine.get().colors();
+        int scrollbarLeft = this.listRight - 6;
+        int scrollbarRight = this.listRight - 2;
+        context.fill(scrollbarLeft, this.listTop, scrollbarRight, this.listBottom, tc.sectionBackground);
+
+        int thumbHeight = Math.max(24, (int) (viewHeight * (viewHeight / (double) contentHeight)));
+        int maxScroll = contentHeight - viewHeight;
+        int available = viewHeight - thumbHeight;
+        int thumbTop = this.listTop + (int) ((this.scrollOffset / (double) maxScroll) * available);
+        boolean thumbHovered = this.draggingScrollbar;
+        context.fill(scrollbarLeft, thumbTop, scrollbarRight, thumbTop + thumbHeight,
+                thumbHovered ? tc.textPrimary : tc.accent);
+    }
+
+    private String categoryToggleLabel() {
+        if (!this.clipsMode) return "Recordings";
+        return this.hindsightCategoryMode ? "Hindsight" : "Clips";
+    }
+
+    private void cycleCategoryView(boolean forward) {
+        if (this.client == null) {
+            return;
+        }
+        int current = !this.clipsMode ? 0 : (this.hindsightCategoryMode ? 2 : 1);
+        int step = forward ? 1 : -1;
+        int next = (current + step + 3) % 3;
+        switch (next) {
+            case 0 -> this.client.setScreen(new VideoCollectionScreen(this.parent, false));
+            case 1 -> this.client.setScreen(new VideoCollectionScreen(this.parent, true));
+            default -> this.client.setScreen(new VideoCollectionScreen(this.parent, true, CLIP_EVENT_HINDSIGHT));
+        }
+    }
+
+    private void openRecordingsFolder() {
+        try {
+            Path dir = RecordableConfig.get().getOutputDirectory();
+            if (this.clipsMode) {
+                dir = dir.resolve("clips");
+                if (this.hindsightCategoryMode) {
+                    dir = dir.resolve(CLIP_EVENT_HINDSIGHT);
+                }
+            }
+            Files.createDirectories(dir);
+            // Desktop only - the toolbar folder button is disabled on Android.
+            Util.getOperatingSystem().open(dir.toUri());
+            setStatus(Text.translatable("screen.recordable.video_collection.opened_folder"), false);
+        } catch (Throwable throwable) {
+            RecordableMod.LOGGER.warn("Failed to open recordings folder from collection screen.", throwable);
+            setStatus(Text.translatable("screen.recordable.video_collection.open_folder_failed"), true);
+        }
+    }
+
+    private void openContainingFolder(Path file) {
+        if (file == null) {
+            return;
+        }
+
+        try {
+            Path parent = file.getParent();
+            if (parent == null) {
+                throw new IOException("Missing parent directory");
+            }
+            Files.createDirectories(parent);
+            // Desktop only - the per-video folder button is a disabled label on Android.
+            Util.getOperatingSystem().open(parent.toUri());
+            setStatus(Text.translatable("screen.recordable.video_collection.opened_folder"), false);
+        } catch (Throwable throwable) {
+            RecordableMod.LOGGER.warn("Failed to open folder for {}", file, throwable);
+            setStatus(Text.translatable("screen.recordable.video_collection.open_folder_failed"), true);
+        }
+    }
+
+    private void playInGame(Path file) {
+        if (file == null || this.client == null) {
+            return;
+        }
+        try {
+            clearThumbnails();
+            this.client.setScreen(new VideoPlayerScreen(file, this));
+        } catch (Throwable throwable) {
+            RecordableMod.LOGGER.warn("Failed to open in-game video player for {}", file, throwable);
+            setStatus(Text.translatable("screen.recordable.video_collection.play_failed"), true);
+        }
+    }
+
+    private void copyPath(Path file) {
+        if (file == null || this.client == null || this.client.keyboard == null) {
+            return;
+        }
+        try {
+            this.client.keyboard.setClipboard(file.toAbsolutePath().toString());
+            setStatus(Text.translatable("screen.recordable.video_collection.copied_path"), false);
+        } catch (Throwable throwable) {
+            RecordableMod.LOGGER.warn("Failed to copy file path for {}", file, throwable);
+            setStatus(Text.translatable("screen.recordable.video_collection.copy_failed"), true);
+        }
+    }
+
+    private void confirmDelete(Path file) {
+        if (file == null) {
+            return;
+        }
+
+        // Protected recordings cannot be deleted until they are unlocked.
+        if (StorageManager.isProtected(RecordableConfig.get(), file.getFileName().toString())) {
+            setStatus(Text.translatable("screen.recordable.video_collection.delete_protected", file.getFileName()), true);
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        if (!file.equals(this.deleteConfirmPath) || now > this.deleteConfirmUntil) {
+            this.deleteConfirmPath = file;
+            this.deleteConfirmUntil = now + DELETE_CONFIRM_MS;
+            setStatus(Text.translatable("screen.recordable.video_collection.delete_confirm", file.getFileName()), true);
+            return;
+        }
+
+        this.deleteConfirmPath = null;
+        this.deleteConfirmUntil = 0L;
+
+        try {
+            Files.deleteIfExists(file);
+            setStatus(Text.translatable("screen.recordable.video_collection.deleted", file.getFileName()), false);
+            refreshVideos();
+        } catch (Throwable throwable) {
+            RecordableMod.LOGGER.warn("Failed to delete recording {}", file, throwable);
+            setStatus(Text.translatable("screen.recordable.video_collection.delete_failed", file.getFileName()), true);
+        }
+    }
+
+    private void clampScroll() {
+        int viewHeight = Math.max(0, this.listBottom - this.listTop);
+        int maxScroll = Math.max(0, this.filteredVideos.size() * ENTRY_HEIGHT - viewHeight);
+        this.scrollOffset = Math.max(0, Math.min(maxScroll, this.scrollOffset));
+    }
+
+    private void setStatus(Text text, boolean isError) {
+        this.statusMessage = text;
+        this.statusIsError = isError;
+    }
+
+    private static String formatSizeMb(long bytes) {
+        return String.format(Locale.ROOT, "%.2f MB", Math.max(0L, bytes) / (1024.0D * 1024.0D));
+    }
+
+    /** Compact size label that switches to GB for large files, used by the share loading bar. */
+    private static String formatSize(long bytes) {
+        double mb = Math.max(0L, bytes) / (1024.0D * 1024.0D);
+        if (mb >= 1024.0D) {
+            return String.format(Locale.ROOT, "%.2f GB", mb / 1024.0D);
+        }
+        return String.format(Locale.ROOT, "%.1f MB", mb);
+    }
+
+    private static boolean isSupportedVideo(Path path) {
+        if (path == null || path.getFileName() == null) {
+            return false;
+        }
+        String name = path.getFileName().toString().toLowerCase(Locale.ROOT);
+        return name.endsWith(".mp4") || name.endsWith(".mkv");
+    }
+
+    private record ActionZone(int x1, int y1, int x2, int y2, Runnable action) {
+        private boolean contains(double x, double y) {
+            return x >= x1 && x < x2 && y >= y1 && y < y2;
+        }
+    }
+
+    private record ThumbnailTexture(Identifier identifier, NativeImageBackedTexture texture) {
+    }
+}

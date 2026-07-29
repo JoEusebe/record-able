@@ -1,0 +1,8 @@
+{
+  "thank_you": {
+    "category": "master",
+    "sounds": [
+      { "name": "recordable:thank_you", "stream": true }
+    ]
+  }
+}

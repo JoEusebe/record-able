@@ -1,0 +1,10 @@
+// Minimal, hand-written stand-ins for the small slice of the Fabric Loader
+// and Simple Voice Chat APIs that the `common` module references.
+//
+// The real artifacts (net.fabricmc:fabric-loader, de.maxhenkel.voicechat)
+// are only published on maven.fabricmc.net / maven.maxhenkel.de, which are
+// not reachable from this build environment. These stubs exist purely to
+// let `common` be type-checked with a real compiler; they are never
+// packaged or shipped, and must never be treated as a replacement for the
+// real dependencies in an actual build/runtime environment.
+description = 'Local compile-only API stand-ins (not for distribution)'

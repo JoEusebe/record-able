@@ -1,0 +1,12 @@
+dependencies {
+    implementation 'com.google.code.gson:gson:2.11.0'
+    implementation 'org.slf4j:slf4j-api:2.0.16'
+    implementation 'org.lwjgl:lwjgl:3.3.3'
+    implementation 'org.lwjgl:lwjgl-openal:3.3.3'
+    implementation 'org.lwjgl:lwjgl-glfw:3.3.3'
+    implementation 'org.lwjgl:lwjgl-tinyfd:3.3.3'
+
+    // See stub-apis/build.gradle: fabric-loader and the Simple Voice Chat API
+    // are only published on repositories unreachable from this environment.
+    compileOnly project(':stub-apis')
+}

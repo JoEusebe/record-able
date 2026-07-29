@@ -1,0 +1,6 @@
+rootProject.name = 'record-able'
+
+include ':stub-apis'
+include ':common'
+
+project(':common').projectDir = file('src/common')
