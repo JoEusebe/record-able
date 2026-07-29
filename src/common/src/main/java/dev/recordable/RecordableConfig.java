@@ -2392,7 +2392,11 @@ public final class RecordableConfig {
     private static int parseHexColor(String value, int fallback) {
         String normalized = sanitizeHexColor(value, String.format(Locale.ROOT, "#%06X", fallback));
         try {
-            return Integer.parseInt(normalized.substring(1), 16);
+            // Use Long.parseLong + cast rather than Integer.parseInt: an 8-digit
+            // AARRGGBB value with the alpha byte's high bit set (e.g. "#C8FFFFFF")
+            // exceeds Integer.MAX_VALUE and Integer.parseInt throws
+            // NumberFormatException for it, silently discarding a valid color.
+            return (int) Long.parseLong(normalized.substring(1), 16);
         } catch (Throwable ignored) {
             return fallback;
         }

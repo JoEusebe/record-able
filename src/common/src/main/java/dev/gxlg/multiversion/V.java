@@ -23,55 +23,64 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 @SuppressWarnings("unused")
 public class V {
-    private static MinecraftVersion version = null;
+    private static volatile MinecraftVersion version = null;
 
     public static MinecraftVersion getVersion() {
-        if (version != null) {
-            return version;
+        MinecraftVersion cached = version;
+        if (cached != null) {
+            return cached;
         }
-        // Try multiple approaches to detect the Minecraft version at runtime.
-        // This handles both intermediary and named mappings across 1.20-1.21.x.
-        try {
-            // Approach 1: SharedConstants → GameVersion → getName() (1.20-1.21.x)
-            R.RClass constants = R.clz("net.minecraft.class_155/net.minecraft.SharedConstants");
+        // Double-checked locking: this is called from multiple threads (render,
+        // network, capture, etc.), so the lazy detection below must not run
+        // concurrently and its result must be published safely.
+        synchronized (V.class) {
+            if (version != null) {
+                return version;
+            }
+            // Try multiple approaches to detect the Minecraft version at runtime.
+            // This handles both intermediary and named mappings across 1.20-1.21.x.
             try {
-                // 1.20.x-1.21.x: GameVersion interface with getName()
-                R.RClass gameVersionClz = R.clz(
-                        "net.minecraft.class_6489/com.mojang.bridge.game.GameVersion"
-                );
-                Object gameVersion = constants.mthd(
-                        "method_16673/getCurrentVersion", gameVersionClz.self()
-                ).invk();
-                // Try getName() first (1.20.x-1.21.1)
+                // Approach 1: SharedConstants → GameVersion → getName() (1.20-1.21.x)
+                R.RClass constants = R.clz("net.minecraft.class_155/net.minecraft.SharedConstants");
                 try {
-                    version = new MinecraftVersion((String) gameVersionClz.inst(gameVersion)
-                            .mthd("method_48019/getName", String.class).invk());
+                    // 1.20.x-1.21.x: GameVersion interface with getName()
+                    R.RClass gameVersionClz = R.clz(
+                            "net.minecraft.class_6489/com.mojang.bridge.game.GameVersion"
+                    );
+                    Object gameVersion = constants.mthd(
+                            "method_16673/getCurrentVersion", gameVersionClz.self()
+                    ).invk();
+                    // Try getName() first (1.20.x-1.21.1)
+                    try {
+                        version = new MinecraftVersion((String) gameVersionClz.inst(gameVersion)
+                                .mthd("method_48019/getName", String.class).invk());
+                    } catch (Exception ignored) {
+                        // Fallback: try name() component accessor (records in newer versions)
+                        version = new MinecraftVersion((String) gameVersionClz.inst(gameVersion)
+                                .mthd("comp_4025/name", String.class).invk());
+                    }
                 } catch (Exception ignored) {
-                    // Fallback: try name() component accessor (records in newer versions)
+                    // Approach 2: WorldVersion interface (1.21.2+)
+                    R.RClass gameVersionClz = R.clz(
+                            "net.minecraft.class_6489/net.minecraft.WorldVersion"
+                    );
+                    Object gameVersion = constants.mthd(
+                            "method_16673/getCurrentVersion", gameVersionClz.self()
+                    ).invk();
                     version = new MinecraftVersion((String) gameVersionClz.inst(gameVersion)
                             .mthd("comp_4025/name", String.class).invk());
                 }
-            } catch (Exception ignored) {
-                // Approach 2: WorldVersion interface (1.21.2+)
-                R.RClass gameVersionClz = R.clz(
-                        "net.minecraft.class_6489/net.minecraft.WorldVersion"
-                );
-                Object gameVersion = constants.mthd(
-                        "method_16673/getCurrentVersion", gameVersionClz.self()
-                ).invk();
-                version = new MinecraftVersion((String) gameVersionClz.inst(gameVersion)
-                        .mthd("comp_4025/name", String.class).invk());
+            } catch (Exception e) {
+                // Last resort: try system property or default
+                String sysProp = System.getProperty("minecraft.version");
+                if (sysProp != null && !sysProp.isEmpty()) {
+                    version = new MinecraftVersion(sysProp);
+                } else {
+                    throw new RuntimeException("Failed to detect Minecraft version", e);
+                }
             }
-        } catch (Exception e) {
-            // Last resort: try system property or default
-            String sysProp = System.getProperty("minecraft.version");
-            if (sysProp != null && !sysProp.isEmpty()) {
-                version = new MinecraftVersion(sysProp);
-            } else {
-                throw new RuntimeException("Failed to detect Minecraft version", e);
-            }
+            return version;
         }
-        return version;
     }
 
     /** Returns true if the running version is strictly higher than {@code other}. */
