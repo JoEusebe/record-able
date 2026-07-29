@@ -298,6 +298,7 @@ public final class AutoClipManager {
             lastXpLevel = -1;
             wasLowHealth = false;
             wasInventoryFull = false;
+            weatherStateInitialized = false;
             resetHindsightState();
             return;
         }
@@ -568,6 +569,8 @@ public final class AutoClipManager {
     private int lastXpLevel = -1;
     private boolean wasRaining = false;
     private boolean wasThundering = false;
+    /** Whether {@link #wasRaining}/{@link #wasThundering} reflect a real observed tick yet. */
+    private boolean weatherStateInitialized = false;
     private boolean wasLowHealth = false;
     private boolean wasInventoryFull = false;
     private int hindsightLowHealthTicks = 0;
@@ -604,12 +607,18 @@ public final class AutoClipManager {
                 case "weather_change" -> {
                     boolean raining = client.world.isRaining();
                     boolean thundering = client.world.isThundering();
-                    if (raining != wasRaining || thundering != wasThundering) {
-                        if (wasRaining || wasThundering) {
-                            String weather = thundering ? "Thunder" : raining ? "Rain" : "Clear";
-                            triggerAutoClip(client, config, "Weather: " + weather);
-                        }
+                    // Fire on every real transition (weather starting OR stopping), matching
+                    // this trigger's documented behavior. The previous guard only fired when
+                    // returning to clear weather (it required the *previous* tick to already
+                    // be raining/thundering), so a storm starting - the more clip-worthy
+                    // moment - was silently never captured. `weatherStateInitialized` still
+                    // suppresses the one false transition on the very first tick we observe
+                    // the world (wasRaining/wasThundering default to false, not "no weather").
+                    if (weatherStateInitialized && (raining != wasRaining || thundering != wasThundering)) {
+                        String weather = thundering ? "Thunder" : raining ? "Rain" : "Clear";
+                        triggerAutoClip(client, config, "Weather: " + weather);
                     }
+                    weatherStateInitialized = true;
                     wasRaining = raining;
                     wasThundering = thundering;
                 }

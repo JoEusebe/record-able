@@ -1087,6 +1087,13 @@ public final class FFmpegEncoder {
                 Thread.currentThread().interrupt();
                 ffmpegAudioProcess.destroyForcibly();
             } finally {
+                // The stdout stream is never read anywhere for this process (only stderr is
+                // drained by audioStderrThread), so it must be closed explicitly here or the
+                // file descriptor leaks every time system-audio capture is used.
+                try {
+                    ffmpegAudioProcess.getInputStream().close();
+                } catch (Throwable ignored) {
+                }
                 ffmpegAudioProcess = null;
             }
         }
