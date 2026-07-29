@@ -141,7 +141,10 @@ public final class RecordingOverlay {
     private static void render(DrawContext context, RenderTickCounter tickCounter) {
         RecordableConfig config = RecordableConfig.get();
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client == null || client.textRenderer == null) return;
+        // config can be null (see the null-checks in renderWatermarks/renderCensorPreview/
+        // renderMousePointer below) - config.showOverlay further down would otherwise NPE
+        // and take out the whole HUD render pass.
+        if (client == null || client.textRenderer == null || config == null) return;
 
         RecordingManager manager = RecordingManager.getInstance();
 
@@ -318,7 +321,7 @@ public final class RecordingOverlay {
     private static void renderMicIndicator(DrawContext context, MinecraftClient client) {
         if (!MicrophoneState.isMicCapturing()) return;
         RecordableConfig config = RecordableConfig.get();
-        if (!config.hudMicVisible) return;
+        if (config == null || !config.hudMicVisible) return;
 
         TextRenderer tr = client.textRenderer;
         boolean live = MicrophoneState.isMicActiveForDisplay();
